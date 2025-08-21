@@ -1,0 +1,855 @@
+  REPORT Z_PICTURE_V10.
+*---------------------------------------------------------------------*
+* Global Data Declarations                                            *
+*---------------------------------------------------------------------*
+DATA: gv_id      TYPE zbk_pers_tablee-pers_id, " Global variable to hold selected ID
+      gv_id_img  TYPE zbk_pers_tablee-pers_id,
+      gv_name    TYPE zbk_pers_tablee-pers_name,
+      gv_dep     TYPE zbk_pers_tablee-pers_dep.
+
+DATA: gv_month TYPE char6. " veya TYPE accp da olabilir
+
+DATA: gs_log   TYPE zbk_pers_tablee.
+
+DATA: gs_log_h TYPE zbk_price_table2.
+
+DATA: go_alv_main    TYPE REF TO cl_gui_alv_grid,    " Main ALV for zbk_pers_tablee
+      go_cont_main TYPE REF TO cl_gui_custom_container. " Container for main ALV
+
+DATA: go_alv_detail  TYPE REF TO cl_gui_alv_grid,    " Detail ALV for ZBK_PRICE_TABLE2
+      go_cont_detail TYPE REF TO cl_gui_custom_container. " Container for detail ALV
+
+*----------------------------------------------------------------------------------
+*RES#M DE###KENLER#-
+*-----------------------------------------------------------------------------------
+DATA: lr_mime_rep TYPE REF TO if_mr_api,
+      lv_filename TYPE string,
+      lv_content  TYPE xstring,
+      lv_length   TYPE i,
+      lv_rc       TYPE sy-subrc,
+      lt_file     TYPE filetable,
+      ls_file     LIKE LINE OF lt_file,
+      lt_data     TYPE STANDARD TABLE OF x255,
+      lv_url      TYPE char255,
+      lv_repid    TYPE sy-repid,
+      lo_docking  TYPE REF TO cl_gui_docking_container,
+      lo_picture  TYPE REF TO cl_gui_picture,
+      lv_time     TYPE string,
+      gv_img_path TYPE string,
+      lv_path     TYPE string.
+
+" Personel verisi için çal##ma alan#
+DATA: ls_pers_data TYPE zbk_pers_tablee.
+
+" Yeni tablo tipi ve dahili tablo tan#m#. Bu, hücre düzeyinde stil belirlememizi sa#lar.
+TYPES: BEGIN OF ty_price,
+         pers_id     TYPE zbk_price_table2-pers_id,
+         pers_name   TYPE zbk_price_table2-pers_name,
+         pers_month  TYPE zbk_price_table2-pers_month,
+         pers_day    TYPE zbk_price_table2-pers_day,
+         zbk_meal    TYPE zbk_price_table2-zbk_meal,
+         zbk_bus     TYPE zbk_price_table2-zbk_bus,
+         cell_style  TYPE lvc_t_styl, " Hücre stili için yeni alan
+       END OF ty_price.
+
+DATA: gt_table_main TYPE TABLE OF zbk_pers_tablee, " Data for main ALV
+      ls_table_main LIKE LINE OF gt_table_main. " Added for the LOOP
+
+DATA: gt_table_detail TYPE TABLE OF ty_price. " Modified detail table type
+DATA: gs_table_detail TYPE ty_price.
+
+
+" Field catalog definitions
+
+DATA: gt_fieldcat_main TYPE lvc_t_fcat,
+      gs_fieldcat_main TYPE lvc_s_fcat.
+
+DATA: gt_fieldcat_detail TYPE lvc_t_fcat,
+      gs_fieldcat_detail TYPE lvc_s_fcat.
+
+* Layout structure for detail ALV
+DATA: gs_layout TYPE lvc_s_layo.
+
+*---------------------------------------------------------------------*
+* Class for Main ALV Events (Double Click)                            *
+*---------------------------------------------------------------------*
+CLASS cl_event_receiver DEFINITION.
+  PUBLIC SECTION.
+    METHODS handle_double_click
+      FOR EVENT double_click OF cl_gui_alv_grid
+        IMPORTING
+          e_row
+          e_column
+          es_row_no.
+ENDCLASS.
+
+CLASS cl_event_receiver IMPLEMENTATION.
+  METHOD handle_double_click.
+    READ TABLE gt_table_main INTO gs_log INDEX es_row_no-row_id.
+    CASE e_column-fieldname.
+      WHEN 'PERS_ID'.
+        IF sy-subrc = 0.
+          gv_id = gs_log-pers_id.
+          gv_name = gs_log-pers_name.
+          gv_dep = gs_log-pers_dep.
+          MESSAGE `Selected Person ID: ` && gv_id TYPE 'I'.
+          gv_id_img = gv_id.
+          PERFORM refresh_detail_alv USING gv_id.
+        ENDIF.
+
+      WHEN 'PICTURE'.
+        DATA: ls_selected_person TYPE zbk_pers_tablee.
+
+        " Çift t#klanan sat#r#n verilerini do#ru bir #ekilde al
+        READ TABLE gt_table_main INTO ls_selected_person INDEX es_row_no-row_id.
+
+        IF sy-subrc = 0.
+          " Resim yolu bo# mu kontrol et
+          SELECT SINGLE picture FROM zbk_pers_tablee INTO gv_img_path WHERE pers_id = ls_selected_person-pers_id.
+
+          IF gv_img_path IS NOT INITIAL.
+            " Ekran 103'e geçi#i sa#la
+            LEAVE TO SCREEN 0103.  " veya CALL SCREEN 0103.
+
+          ELSE.
+              gv_id = gs_log-pers_id.
+              gv_id_img = gv_id.
+              IF gv_id_img IS INITIAL.
+                 MESSAGE 'Personel seçilmedi!' TYPE 'I' DISPLAY LIKE 'E'.
+              ELSE.
+                 LEAVE TO SCREEN '0102'.
+              ENDIF.
+          ENDIF.
+        ENDIF.
+    ENDCASE.
+  ENDMETHOD.
+ENDCLASS.
+
+*---------------------------------------------------------------------*
+* Class for Detail ALV Events (Data Changed)                          *
+*---------------------------------------------------------------------*
+CLASS cl_event_receiver_h DEFINITION.
+  PUBLIC SECTION.
+    METHODS handle_data_changed
+      FOR EVENT data_changed OF cl_gui_alv_grid
+        IMPORTING
+          er_data_changed
+          e_onf4
+          e_onf4_before
+          e_onf4_after
+          e_ucomm.
+ENDCLASS.
+
+CLASS cl_event_receiver_h IMPLEMENTATION.
+  METHOD handle_data_changed.
+    DATA: ls_mod      TYPE lvc_s_modi,
+          lv_day      TYPE zbk_price_table2-pers_day,
+          lv_meal     TYPE zbk_price_table2-zbk_meal,
+          lv_bus      TYPE zbk_price_table2-zbk_bus.
+
+    "* Veritaban# tablosu yap#s#na sahip yeni bir çal##ma alan#
+    DATA: ls_update_data TYPE zbk_price_table2.
+
+    LOOP AT er_data_changed->mt_mod_cells INTO ls_mod.
+      READ TABLE gt_table_detail INTO DATA(ls_row_data) INDEX ls_mod-row_id.
+      IF sy-subrc = 0.
+
+        "* Yeni çal##ma alan#na sadece gerekli verileri ta##
+        MOVE-CORRESPONDING ls_row_data TO ls_update_data.
+
+        IF ls_mod-fieldname = 'PERS_DAY'.
+          lv_day = CONV zbk_price_table2-pers_day( ls_mod-value ).
+          lv_meal = lv_day * 200.
+          lv_bus  = lv_day * 100.
+
+          ls_update_data-pers_day  = lv_day.
+          ls_update_data-zbk_meal  = lv_meal.
+          ls_update_data-zbk_bus   = lv_bus.
+
+          "* Internal tabloyu güncelle
+          ls_row_data-pers_day = lv_day.
+          ls_row_data-zbk_meal = lv_meal.
+          ls_row_data-zbk_bus  = lv_bus.
+          MODIFY gt_table_detail FROM ls_row_data INDEX ls_mod-row_id.
+
+          " ALV ekran#n# güncelle
+          CALL METHOD er_data_changed->modify_cell
+            EXPORTING i_row_id = ls_mod-row_id i_fieldname = 'ZBK_MEAL' i_value = lv_meal.
+          CALL METHOD er_data_changed->modify_cell
+            EXPORTING i_row_id = ls_mod-row_id i_fieldname = 'ZBK_BUS'  i_value = lv_bus.
+
+        ELSEIF ls_mod-fieldname = 'PERS_MONTH'.
+          ls_update_data-pers_month = CONV char6( ls_mod-value ).
+
+          "* Internal tabloyu güncelle
+          ls_row_data-pers_month = CONV char6( ls_mod-value ).
+          MODIFY gt_table_detail FROM ls_row_data INDEX ls_mod-row_id.
+
+        ENDIF.
+
+        " Veritaban#n# yeni, uyumlu çal##ma alan# ile güncelle
+        UPDATE zbk_price_table2 FROM ls_update_data.
+
+        IF sy-subrc = 0.
+          MESSAGE `Kay#t ba#ar#yla güncellendi.` TYPE 'S'.
+        ELSE.
+          MESSAGE `Kay#t güncellenirken bir hata olu#tu.` TYPE 'E'.
+        ENDIF.
+
+      ENDIF.
+    ENDLOOP.
+
+    COMMIT WORK. " Save changes to the database
+  ENDMETHOD.
+ENDCLASS.
+
+
+DATA: go_event_receiver TYPE REF TO cl_event_receiver. " For main ALV double-click
+DATA: go_event_receiver_h TYPE REF TO cl_event_receiver_h. " For detail ALV data changed
+*---------------------------------------------------------------------*
+* Start of Program Execution                                          *
+*---------------------------------------------------------------------*
+
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+  " Initial load for the main ALV
+  SELECT * FROM zbk_pers_tablee INTO TABLE gt_table_main.
+
+  " Resim yolu sütununu formatla
+  LOOP AT gt_table_main INTO ls_table_main.
+    IF ls_table_main-picture IS NOT INITIAL.
+      ls_table_main-picture = 'Görüntüle'.
+    ELSE.
+      ls_table_main-picture = 'Ekle'.
+    ENDIF.
+    MODIFY gt_table_main FROM ls_table_main.
+  ENDLOOP.
+
+  CALL SCREEN 0100.
+
+*---------------------------------------------------------------------*
+* Module STATUS_0100 OUTPUT (PBO - Process Before Output)               *
+*--------------------------------------------------------------------*
+MODULE STATUS_0100 OUTPUT.
+
+  SET PF-STATUS '0100'. " Set PF-Status for screen 0100
+  SET TITLEBAR 'MAIN_ALV_REPORT'. " Set Titlebar
+
+  " --- Main ALV Initialization (Personnel Data) ---
+  IF go_cont_main IS INITIAL.
+    CREATE OBJECT go_cont_main
+      EXPORTING
+        container_name = 'CC_ALV'. " <--- Updated container name here
+
+    CREATE OBJECT go_alv_main
+      EXPORTING
+        i_parent = go_cont_main.
+
+    PERFORM build_fieldcat_main. " Build field catalog for main ALV
+
+    CREATE OBJECT go_event_receiver. " Create event handler for main ALV
+    SET HANDLER go_event_receiver->handle_double_click FOR go_alv_main. " Register double-click event
+    CALL METHOD go_alv_main->set_table_for_first_display
+      CHANGING
+        it_outtab       = gt_table_main
+        it_fieldcatalog = gt_fieldcat_main.
+  ENDIF.
+
+  " --- Detail ALV Initialization (Price Data) ---
+  " Create detail ALV objects, but don't display data yet.
+  " It will be displayed upon a double-click on the main ALV.
+  IF go_cont_detail IS INITIAL.
+    CREATE OBJECT go_cont_detail
+      EXPORTING
+        container_name = 'CC_ALV_HS'. " <--- Updated container name here
+    CREATE OBJECT go_alv_detail
+      EXPORTING
+        i_parent = go_cont_detail.
+
+    PERFORM build_fieldcat_detail. " Build field catalog for detail ALV
+
+    " Layout yap#s#na stil alan#n# ba#la
+    gs_layout-stylefname = 'CELL_STYLE'.
+
+    CREATE OBJECT go_event_receiver_h. " Create event handler for detail ALV
+    CALL METHOD go_alv_detail->register_edit_event
+      EXPORTING
+        i_event_id = cl_gui_alv_grid=>mc_evt_modified.
+    SET HANDLER go_event_receiver_h->handle_data_changed FOR go_alv_detail.
+  ENDIF.
+ENDMODULE.
+
+*---------------------------------------------------------------------*
+* Module USER_COMMAND_0100 INPUT (PAI - Process After Input)          *
+*---------------------------------------------------------------------*
+
+MODULE user_command_0100 INPUT.
+  CASE sy-ucomm.
+    WHEN '&LEAVE'.
+      LEAVE TO SCREEN 0.
+    WHEN '&EKLE'.
+      CLEAR gs_log.
+      gs_log-pers_id  = gv_id.
+      gs_log-pers_name = gv_name.
+      gs_log-pers_dep  = gv_dep.
+
+      INSERT zbk_pers_tablee FROM gs_log.
+      IF sy-subrc = 0.
+        COMMIT WORK AND WAIT.
+        MESSAGE 'Kay#t eklendi.' TYPE 'I'.
+        PERFORM refresh_main_alv.
+      ELSE.
+        MESSAGE 'Kay#t eklenemedi.' TYPE 'I'.
+      ENDIF.
+
+    WHEN '&LISTELE_MAIN'.
+      PERFORM refresh_main_alv.
+    WHEN '&IMG_SCREEN'.
+      IF gv_id_img IS INITIAL.
+        MESSAGE 'Personel seçilmedi!' TYPE 'I' DISPLAY LIKE 'E'.
+      ELSE.
+        SET SCREEN '0102'.
+      ENDIF.
+    WHEN '&EKLE_DETAIL'.
+      IF gv_month IS INITIAL.
+        MESSAGE 'Lütfen dönem bilgisini giriniz.' TYPE 'E'.
+        EXIT.
+      ENDIF.
+
+      CLEAR gs_log_h.
+      gs_log_h-pers_id      = gv_id.
+      gs_log_h-pers_name    = gv_name.
+      gs_log_h-pers_month   = gv_month.
+      gs_log_h-pers_day     = 0.
+      gs_log_h-zbk_meal     = 0.
+      gs_log_h-zbk_bus      = 0.
+
+      INSERT ZBK_PRICE_TABLE2 FROM gs_log_h.
+      IF sy-subrc = 0.
+        COMMIT WORK AND WAIT.
+        MESSAGE 'Detay kay#t eklendi.' TYPE 'S'.
+        PERFORM refresh_detail_alv USING gv_id.
+      ELSE.
+        MESSAGE 'Detay kay#t eklenemedi.' TYPE 'I'.
+      ENDIF.
+
+    WHEN '&LISTELE_DETAIL'.
+      PERFORM refresh_detail_alv USING gv_id.
+
+    WHEN '&SIL'. " Personel silme
+      DATA: lt_selected_rows TYPE lvc_t_row,
+            lv_index         TYPE sy-tabix,
+            ls_selected_data TYPE zbk_pers_tablee.
+
+      CALL METHOD go_alv_main->get_selected_rows
+        IMPORTING et_index_rows = lt_selected_rows.
+
+      READ TABLE lt_selected_rows INTO DATA(ls_selected_row) INDEX 1.
+      IF sy-subrc = 0.
+        lv_index = ls_selected_row-index.
+        READ TABLE gt_table_main INTO ls_selected_data INDEX lv_index.
+        IF sy-subrc = 0.
+          DELETE FROM zbk_pers_tablee WHERE pers_id = ls_selected_data-pers_id.
+          IF sy-subrc = 0.
+            COMMIT WORK AND WAIT.
+            MESSAGE 'Personel silindi.' TYPE 'S'.
+            PERFORM refresh_main_alv.
+          ELSE.
+            MESSAGE 'Personel silinemedi.' TYPE 'E'.
+          ENDIF.
+        ENDIF.
+      ELSE.
+        MESSAGE 'Lütfen silinecek personel sat#r#n# seçiniz.' TYPE 'E'.
+      ENDIF.
+
+    WHEN '&SIL_DETAIL'. " Dönem silme
+      DATA: lt_selected_rows_d TYPE lvc_t_row,
+            lv_index_d         TYPE sy-tabix,
+            ls_selected_data_d TYPE ty_price. " Changed to new table type
+
+      CALL METHOD go_alv_detail->get_selected_rows
+        IMPORTING et_index_rows = lt_selected_rows_d.
+
+      READ TABLE lt_selected_rows_d INTO DATA(ls_selected_row_d) INDEX 1.
+      IF sy-subrc = 0.
+        lv_index_d = ls_selected_row_d-index.
+        READ TABLE gt_table_detail INTO ls_selected_data_d INDEX lv_index_d.
+        IF sy-subrc = 0.
+          DELETE FROM zbk_price_table2
+            WHERE pers_id = ls_selected_data_d-pers_id
+              AND pers_month = ls_selected_data_d-pers_month.
+          IF sy-subrc = 0.
+            COMMIT WORK AND WAIT.
+            MESSAGE 'Dönem kayd# silindi.' TYPE 'S'.
+            PERFORM refresh_detail_alv USING gv_id.
+          ELSE.
+            MESSAGE 'Dönem kayd# silinemedi.' TYPE 'E'.
+          ENDIF.
+        ENDIF.
+      ELSE.
+        MESSAGE 'Lütfen silinecek dönem sat#r#n# seçiniz.' TYPE 'E'.
+      ENDIF.
+
+    WHEN '&IMG_SHOW'. " Resim göster
+      DATA: lt_selected_main TYPE lvc_t_row,
+            lv_selected_index TYPE sy-tabix,
+            ls_selected_person TYPE zbk_pers_tablee.
+
+      CALL METHOD go_alv_main->get_selected_rows
+        IMPORTING et_index_rows = lt_selected_main.
+
+      READ TABLE lt_selected_main INTO DATA(ls_selected_main) INDEX 1.
+      IF sy-subrc = 0.
+        lv_selected_index = ls_selected_main-index.
+        READ TABLE gt_table_main INTO ls_selected_person INDEX lv_selected_index.
+        IF sy-subrc = 0.
+          SELECT SINGLE picture FROM zbk_pers_tablee INTO gv_img_path WHERE pers_id = ls_selected_person-pers_id.
+
+          IF gv_img_path IS NOT INITIAL.
+            SET SCREEN 0103.
+          ELSE.
+            MESSAGE 'Seçili personel için resim bulunamad#.' TYPE 'E'.
+          ENDIF.
+        ENDIF.
+      ELSE.
+        MESSAGE 'Lütfen resmi görüntülenecek personel sat#r#n# seçiniz.' TYPE 'E'.
+      ENDIF.
+
+    WHEN '&UPLOAD_CSV'. " CSV Upload program#n# ça##r
+      " CSV upload program#n# ayr# bir session'da çal##t#r
+      SUBMIT z_upload_pers_table2 VIA SELECTION-SCREEN AND RETURN.
+      " Upload i#lemi tamamland#ktan sonra ana ALV'yi yenile
+      MESSAGE 'CSV upload i#lemi tamamland#. Veriler yenileniyor...' TYPE 'S'.
+      PERFORM refresh_main_alv.
+  ENDCASE.
+ENDMODULE.
+
+*---------------------------------------------------------------------*
+* Form Routines
+*---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*& Form BUILD_FIELDCAT_MAI
+*&---------------------------------------------------------------------*
+* Build field catalog for zbk_pers_tablee (Main ALV)
+*---------------------------------------------------------------------*
+FORM build_fieldcat_main.
+  REFRESH gt_fieldcat_main.
+  CLEAR gs_fieldcat_main.
+  gs_fieldcat_main-fieldname = 'PERS_ID'.
+  gs_fieldcat_main-coltext   = 'Personel ID'.
+  gs_fieldcat_main-outputlen = 10.
+  APPEND gs_fieldcat_main TO gt_fieldcat_main.
+  CLEAR gs_fieldcat_main.
+  gs_fieldcat_main-fieldname = 'PERS_NAME'.
+  gs_fieldcat_main-coltext   = 'Personel Ad#'.
+  gs_fieldcat_main-outputlen = 15.
+  APPEND gs_fieldcat_main TO gt_fieldcat_main.
+  CLEAR gs_fieldcat_main.
+  gs_fieldcat_main-fieldname = 'PERS_DEP'.
+  gs_fieldcat_main-coltext   = 'Departman'.
+  gs_fieldcat_main-outputlen = 15.
+  APPEND gs_fieldcat_main TO gt_fieldcat_main.
+  CLEAR gs_fieldcat_main.
+  gs_fieldcat_main-fieldname = 'PICTURE'.
+  gs_fieldcat_main-coltext   = 'Resim Durumu'. " Changed text
+  gs_fieldcat_main-outputlen = 25. " Adjusted length
+  APPEND gs_fieldcat_main TO gt_fieldcat_main.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form BUILD_FIELDCAT_DETAIL
+*&---------------------------------------------------------------------*
+* Build field catalog for ZBK_PRICE_TABLE2 (Detail ALV)
+*---------------------------------------------------------------------*
+
+FORM build_fieldcat_detail.
+  REFRESH gt_fieldcat_detail.
+  CLEAR gs_fieldcat_detail.
+
+  gs_fieldcat_detail-fieldname     = 'PERS_ID'.
+  gs_fieldcat_detail-coltext       = 'Personel ID'.
+  gs_fieldcat_detail-outputlen     = 10.
+  "gs_fieldcat_detail-no_out        = abap_true. " Hide ID in detail ALV (already filtered)
+  APPEND gs_fieldcat_detail TO gt_fieldcat_detail.
+  CLEAR gs_fieldcat_detail.
+  gs_fieldcat_detail-fieldname     = 'PERS_NAME'.
+  gs_fieldcat_detail-coltext       = 'Personel Ad#'.
+  gs_fieldcat_detail-outputlen     = 30.
+  gs_fieldcat_detail-no_out        = abap_true. " Hide Name (already filtered)
+  APPEND gs_fieldcat_detail TO gt_fieldcat_detail.
+  CLEAR gs_fieldcat_detail.
+  gs_fieldcat_detail-fieldname     = 'PERS_MONTH'.
+  gs_fieldcat_detail-coltext       = 'Dönem'.
+  gs_fieldcat_detail-outputlen     = 10.
+  APPEND gs_fieldcat_detail TO gt_fieldcat_detail.
+  CLEAR gs_fieldcat_detail.
+  gs_fieldcat_detail-fieldname     = 'PERS_DAY'.
+  gs_fieldcat_detail-coltext       = 'Gün'.
+  gs_fieldcat_detail-outputlen     = 10.
+  gs_fieldcat_detail-edit          = abap_true. " Initially set as editable for all
+  APPEND gs_fieldcat_detail TO gt_fieldcat_detail.
+  CLEAR gs_fieldcat_detail.
+  gs_fieldcat_detail-fieldname     = 'ZBK_MEAL'.
+  gs_fieldcat_detail-coltext       = 'Yemek'.
+  gs_fieldcat_detail-outputlen     = 9.
+  APPEND gs_fieldcat_detail TO gt_fieldcat_detail.
+  CLEAR gs_fieldcat_detail.
+  gs_fieldcat_detail-fieldname     = 'ZBK_BUS'.
+  gs_fieldcat_detail-coltext       = 'Otobüs'.
+  gs_fieldcat_detail-outputlen     = 9.
+  APPEND gs_fieldcat_detail TO gt_fieldcat_detail.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form REFRESH_MAIN_ALV
+*&---------------------------------------------------------------------*
+* Refresh main ALV grid
+*---------------------------------------------------------------------*
+
+FORM refresh_main_alv.
+  " Reload data for main ALV
+  SELECT * FROM zbk_pers_tablee INTO TABLE gt_table_main.
+  " Resim yolu sütununu formatla
+  LOOP AT gt_table_main INTO ls_table_main.
+    IF ls_table_main-picture IS NOT INITIAL.
+      ls_table_main-picture = 'Görüntüle'.
+    ELSE.
+      ls_table_main-picture = 'Ekle'.
+    ENDIF.
+    MODIFY gt_table_main FROM ls_table_main.
+  ENDLOOP.
+
+  IF go_alv_main IS NOT INITIAL.
+    CALL METHOD go_alv_main->set_table_for_first_display
+      CHANGING
+        it_outtab       = gt_table_main
+        it_fieldcatalog = gt_fieldcat_main.
+    CALL METHOD go_alv_main->refresh_table_display.
+  ENDIF.
+ENDFORM.
+
+*&---------------------------------------------------------------------*
+*& Form REFRESH_DETAIL_ALV
+*&---------------------------------------------------------------------*
+* Reloads data and refreshes detail ALV grid with filter
+*---------------------------------------------------------------------*
+
+FORM refresh_detail_alv USING iv_pers_id TYPE zbk_pers_id_de.
+  DATA: lt_price_table   TYPE TABLE OF zbk_price_table2,
+        ls_price_table   TYPE zbk_price_table2,
+        lv_current_month TYPE char6.
+  DATA: ls_style TYPE lvc_s_styl.
+
+  " Mevcut ay bilgisini al (YYYYMM format#nda)
+  lv_current_month = sy-datum(6).
+
+  " Clear existing data
+  REFRESH gt_table_detail.
+
+  " Reload data from the database, filtered by the provided ID
+  IF iv_pers_id IS NOT INITIAL.
+    SELECT * FROM zbk_price_table2 INTO TABLE lt_price_table WHERE pers_id = iv_pers_id.
+
+    " Transfer data to the new internal table with cell style
+    LOOP AT lt_price_table INTO ls_price_table.
+      MOVE-CORRESPONDING ls_price_table TO gs_table_detail.
+      CLEAR gs_table_detail-cell_style. " Önceki stilleri temizle
+
+      " Yaln#zca mevcut ay ise "PERS_DAY" alan#n# düzenlenebilir yap
+      IF ls_price_table-pers_month = lv_current_month.
+        ls_style-fieldname = 'PERS_DAY'.
+        ls_style-style = cl_gui_alv_grid=>mc_style_enabled. " Düzenlenebilir stil
+        APPEND ls_style TO gs_table_detail-cell_style.
+      ELSE.
+        ls_style-fieldname = 'PERS_DAY'.
+        ls_style-style = cl_gui_alv_grid=>mc_style_disabled. " Düzenlenemez stil
+        APPEND ls_style TO gs_table_detail-cell_style.
+      ENDIF.
+
+      APPEND gs_table_detail TO gt_table_detail.
+    ENDLOOP.
+  ELSE.
+    " If no ID is provided (e.g., initial load), ensure detail ALV is empty
+    MESSAGE 'Lütfen personel seçimi yap#n#z.' TYPE 'I' DISPLAY LIKE 'E'.
+  ENDIF.
+
+  IF go_alv_detail IS NOT INITIAL.
+    " Set the table for display with the filtered data
+    CALL METHOD go_alv_detail->set_table_for_first_display
+      EXPORTING
+        is_layout         = gs_layout " Layout yap#s#n# kullan
+        i_structure_name  = 'TY_PRICE' " Changed to the new structure name
+      CHANGING
+        it_outtab         = gt_table_detail
+        it_fieldcatalog   = gt_fieldcat_detail.
+
+    " Refresh ALV grid
+    CALL METHOD go_alv_detail->refresh_table_display.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_0102  OUTPUT
+*&---------------------------------------------------------------------*
+* text
+*----------------------------------------------------------------------*
+MODULE STATUS_0102 OUTPUT.
+* SET PF-STATUS 'xxxxxxxx'.
+* SET TITLEBAR 'xxx'.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Module  STATUS_0103  OUTPUT
+*&---------------------------------------------------------------------*
+* Resim gösterim ekran# için PBO
+*----------------------------------------------------------------------*
+MODULE STATUS_0103 OUTPUT.
+  SET PF-STATUS '0103'.
+  SET TITLEBAR 'IMG_DISPLAY'.
+
+  " Resim gösterim için container ve picture control olu#tur
+  IF lo_docking IS INITIAL.
+    CREATE OBJECT lo_docking
+      EXPORTING
+        repid     = sy-repid
+        dynnr     = sy-dynnr
+        side      = lo_docking->dock_at_LEFT
+        extension = 300.
+  ENDIF.
+
+  IF lo_picture IS INITIAL.
+    CREATE OBJECT lo_picture
+      EXPORTING
+        parent = lo_docking.
+  ENDIF.
+  " MIME deposundan resmi yükle ve göster
+  IF gv_img_path IS NOT INITIAL.
+    PERFORM display_image_from_mime.
+  ENDIF.
+ENDMODULE.
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0102  INPUT
+*&---------------------------------------------------------------------*
+* text
+*----------------------------------------------------------------------*
+MODULE USER_COMMAND_0102 INPUT.
+  CASE sy-ucomm.
+    WHEN '&BACK'.
+      " Docking container ve picture control'ü serbest b#rak
+      IF lo_picture IS NOT INITIAL.
+        CALL METHOD lo_picture->free.
+        FREE lo_picture.
+      ENDIF.
+      IF lo_docking IS NOT INITIAL.
+        CALL METHOD lo_docking->free.
+        FREE lo_docking.
+      ENDIF.
+
+      SET SCREEN 0100.
+    WHEN '&IMG_EKLE'.
+      " Dosya seç
+      cl_gui_frontend_services=>file_open_dialog(
+        CHANGING
+          file_table = lt_file
+          rc         = lv_rc
+      ).
+
+      READ TABLE lt_file INTO ls_file INDEX 1.
+      IF sy-subrc <> 0.
+        MESSAGE 'Dosya seçilmedi.' TYPE 'I'.
+        STOP.
+      ENDIF.
+
+      lv_filename = ls_file-filename.
+
+      " Dosyay# oku
+      cl_gui_frontend_services=>gui_upload(
+        EXPORTING
+          filename    = lv_filename
+          filetype    = 'BIN'
+        IMPORTING
+          filelength  = lv_length
+        CHANGING
+          data_tab    = lt_data
+        EXCEPTIONS
+          OTHERS      = 1
+      ).
+
+      IF sy-subrc <> 0.
+        MESSAGE 'Dosya yüklenemedi.' TYPE 'E'.
+        STOP.
+      ENDIF.
+
+      " #kili veriyi xstring'e çevir
+      CALL FUNCTION 'SCMS_BINARY_TO_XSTRING'
+        EXPORTING
+          input_length = lv_length
+        IMPORTING
+          buffer       = lv_content
+        TABLES
+          binary_tab   = lt_data
+        EXCEPTIONS
+          OTHERS       = 1.
+
+      IF sy-subrc <> 0.
+        MESSAGE 'Dönü#türme hatas#.' TYPE 'E'.
+        STOP.
+      ENDIF.
+
+      " Dinamik MIME yolu olu#tur
+      GET TIME FIELD lv_time.
+      CONCATENATE '/SAP/PUBLIC/IMG_' lv_time '.jpg' INTO lv_path.
+
+
+      " MIME deposuna yükle
+      lr_mime_rep = cl_mime_repository_api=>if_mr_api~get_api( ).
+
+      TRY.
+          lr_mime_rep->put(
+            EXPORTING
+              i_url     = lv_path
+              i_content = lv_content
+          ).
+          MESSAGE |{ lv_path } yoluna ba#ar#yla yüklendi.| TYPE 'S'.
+          gv_img_path = lv_path.
+
+          " --- Düzeltilmi# Kod Bölümü ---
+          " ZBK_PERS_TABLEE tablosunu güncelle
+          SELECT SINGLE *
+            FROM zbk_pers_tablee
+            INTO CORRESPONDING FIELDS OF ls_pers_data
+            WHERE pers_id = gv_id_img. " PERS_ID olarak düzeltildi
+
+          IF sy-subrc = 0. " Kay#t bulunduysa
+            ls_pers_data-picture = gv_img_path. " Resim yolunu PICTURE sütununa ata
+            MODIFY zbk_pers_tablee FROM ls_pers_data.
+            IF sy-subrc = 0.
+              COMMIT WORK AND WAIT.
+              MESSAGE 'Resim yolu personele ba#ar#yla kaydedildi.' TYPE 'S'.
+            ELSE.
+              MESSAGE 'Resim yolu kaydedilirken hata olu#tu.' TYPE 'E'.
+            ENDIF.
+          ELSE.
+            MESSAGE 'Belirtilen personel ID''sine sahip kay#t bulunamad#.' TYPE 'E'.
+          ENDIF.
+
+        CATCH cx_root INTO DATA(lx).
+          MESSAGE lx->get_text( ) TYPE 'E'.
+          STOP.
+      ENDTRY.
+
+      " XSTRING # BINARY (görüntüleme için)
+      CALL FUNCTION 'SCMS_XSTRING_TO_BINARY'
+        EXPORTING
+          buffer     = lv_content
+        TABLES
+          binary_tab = lt_data.
+
+      " Geçici URL olu#tur
+      CALL FUNCTION 'DP_CREATE_URL'
+        EXPORTING
+          type    = 'IMAGE'
+          subtype = 'JPG'
+        TABLES
+          data    = lt_data
+        CHANGING
+          url     = lv_url.
+
+      IF lv_url IS INITIAL.
+        MESSAGE 'Görsel URL olu#turulamad#.' TYPE 'E'.
+        STOP.
+      ENDIF.
+
+      " Resim Konteyneri ve Gösterim
+      lv_repid = sy-repid.
+
+      IF lo_docking IS INITIAL.
+        CREATE OBJECT lo_docking
+          EXPORTING
+            repid     = lv_repid
+            dynnr     = sy-dynnr
+            side      = lo_docking->dock_at_left
+            extension = 500.
+      ENDIF.
+
+      IF lo_picture IS INITIAL.
+        CREATE OBJECT lo_picture
+          EXPORTING
+            parent = lo_docking.
+      ENDIF.
+
+      lo_picture->load_picture_from_url_async( lv_url ).
+  ENDCASE.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*&      Module  USER_COMMAND_0103  INPUT
+*&---------------------------------------------------------------------*
+* Resim gösterim ekran# için PAI
+*----------------------------------------------------------------------*
+MODULE USER_COMMAND_0103 INPUT.
+  CASE sy-ucomm.
+    WHEN '&BACK'.
+      " Container ve picture control'ü temizle
+      IF lo_picture IS NOT INITIAL.
+        CALL METHOD lo_picture->free.
+        FREE lo_picture.
+      ENDIF.
+
+      IF lo_docking IS NOT INITIAL.
+        CALL METHOD lo_docking->free.
+        FREE lo_docking.
+      ENDIF.
+
+      SET SCREEN 0100.
+  ENDCASE.
+ENDMODULE.
+
+*&---------------------------------------------------------------------*
+*& Form DISPLAY_IMAGE_FROM_MIME
+*&---------------------------------------------------------------------*
+* MIME deposundan resmi al#p gösterir
+*----------------------------------------------------------------------*
+FORM display_image_from_mime.
+  DATA: lv_mime_content  TYPE xstring,
+        lt_binary_data   TYPE STANDARD TABLE OF x255,
+        lv_display_url   TYPE char255.
+
+  " MIME deposundan resim içeri#ini al
+  lr_mime_rep = cl_mime_repository_api=>if_mr_api~get_api( ).
+
+  TRY.
+      lr_mime_rep->get(
+        EXPORTING
+          i_url     = gv_img_path
+        IMPORTING
+          e_content = lv_mime_content
+      ).
+
+      " XSTRING'i binary table'a çevir
+      CALL FUNCTION 'SCMS_XSTRING_TO_BINARY'
+        EXPORTING
+          buffer     = lv_mime_content
+        TABLES
+          binary_tab = lt_binary_data.
+
+      " Görüntüleme için geçici URL olu#tur
+      CALL FUNCTION 'DP_CREATE_URL'
+        EXPORTING
+          type    = 'IMAGE'
+          subtype = 'JPG'
+        TABLES
+          data    = lt_binary_data
+        CHANGING
+          url     = lv_display_url.
+
+      " Resmi picture control'de göster
+      IF lv_display_url IS NOT INITIAL AND lo_picture IS NOT INITIAL.
+        lo_picture->load_picture_from_url_async( lv_display_url ).
+      ELSE.
+        MESSAGE 'Resim gösterilemedi.' TYPE 'E'.
+      ENDIF.
+
+    CATCH cx_root INTO DATA(lx_error).
+      MESSAGE |Resim yüklenirken hata: { lx_error->get_text( ) }| TYPE 'E'.
+  ENDTRY.
+ENDFORM.
